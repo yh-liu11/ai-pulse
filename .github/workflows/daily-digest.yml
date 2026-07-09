@@ -1,0 +1,115 @@
+name: Generate Daily Feed
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # UTC 22:00 = Beijing 06:00
+  workflow_dispatch:
+    inputs:
+      x_llm:
+        description: 'LLM for X/Twitter summaries'
+        required: false
+        default: 'config'
+        type: choice
+        options:
+          - 'config'
+          - 'doubao-pro'
+          - 'doubao-turbo'
+          - 'deepseek-pro'
+          - 'deepseek-flash'
+          - 'minimax-m3'
+      generate_summaries:
+        description: 'Generate central LLM summaries. Scheduled runs always do this.'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      transcribe_missing:
+        description: 'Use Volc ASR to transcribe selected podcasts without public transcripts.'
+        required: false
+        default: 'config'
+        type: choice
+        options:
+          - 'config'
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements-central.txt
+
+      - name: Generate feeds
+        env:
+          TWITTER_COOKIES: ${{ secrets.TWITTER_COOKIES }}
+        run: python scripts/generate_feed.py
+
+      - name: Transcribe selected missing podcast transcripts
+        if: ${{ github.event_name == 'schedule' || inputs.transcribe_missing == 'true' || inputs.transcribe_missing == 'config' }}
+        env:
+          VOLC_ASR_API_KEY: ${{ secrets.VOLC_ASR_API_KEY }}
+        run: python scripts/transcribe_missing_podcasts.py
+
+      - name: Generate central summaries
+        if: ${{ github.event_name == 'schedule' || inputs.generate_summaries == 'true' }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          X_LLM_PRESET: ${{ inputs.x_llm || 'config' }}
+        run: |
+          pids=""
+          if [ "$X_LLM_PRESET" = "deepseek-pro" ] || [ "$X_LLM_PRESET" = "deepseek-flash" ]; then
+            x_key="$DEEPSEEK_API_KEY"
+          elif [ "$X_LLM_PRESET" = "minimax-m3" ]; then
+            x_key="$MINIMAX_API_KEY"
+          else
+            x_key="$ARK_API_KEY"
+          fi
+          if [ -n "$x_key" ]; then
+            python scripts/generate_summaries.py --profile zh_standard --type x --x-llm "$X_LLM_PRESET" --max-workers 3 &
+            pids="$pids $!"
+          else
+            echo "Required API key is not set; skipping X summaries for $X_LLM_PRESET."
+          fi
+          if [ -n "$ARK_API_KEY" ]; then
+            python scripts/generate_summaries.py --profile zh_standard --type papers --limit 12 --max-workers 4 &
+            pids="$pids $!"
+          else
+            echo "ARK_API_KEY is not set; skipping paper summaries."
+          fi
+          if [ -n "$DEEPSEEK_API_KEY" ]; then
+            python scripts/generate_summaries.py --profile zh_short --profile zh_standard --profile zh_deep --type podcasts --limit 5 &
+            pids="$pids $!"
+          else
+            echo "DEEPSEEK_API_KEY is not set; skipping podcast summaries."
+          fi
+          for pid in $pids; do
+            wait "$pid"
+          done
+
+      - name: Commit feeds
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add feeds/feed-x.json feeds/feed-podcasts.json feeds/feed-arxiv.json -f
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.generate_summaries }}" = "true" ]; then
+            [ -f feeds/feed-summaries.json ] && git add feeds/feed-summaries.json -f
+            [ -d content/summaries ] && git add content/summaries -f
+          fi
+          git diff --staged --quiet || git commit -m "Feed update $(date -u +%Y-%m-%d)"
+          git push

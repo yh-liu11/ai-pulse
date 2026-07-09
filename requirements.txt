@@ -1,0 +1,5 @@
+# User-side (Agent) dependencies.
+# prepare_digest.py / mark_delivered.py / deliver.py only need httpx.
+# [socks] keeps GitHub raw fetch working behind SOCKS proxies (all_proxy=socks5://...).
+# Central feed-generation dependencies live in requirements-central.txt.
+httpx[socks]>=0.27
